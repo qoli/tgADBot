@@ -1,0 +1,29 @@
+{
+  "name": "tgadbot",
+  "version": "0.1.0",
+  "description": "Telegram advertisement detection bot",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "dev": "tsx watch bot.js",
+    "start": "node bot.js",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "lowdb": "^7.0.1",
+    "node-telegram-bot-api": "^0.63.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "tsx": "^4.7.0",
+    "vitest": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "pnpm@9.0.5"
+}

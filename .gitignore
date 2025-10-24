@@ -1,0 +1,32 @@
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data
+data/
+!data/.gitignore
+
+# Logs & coverage
+logs/
+*.log
+coverage/
+.nyc_output/
+
+# TypeScript incremental cache
+*.tsbuildinfo
+
+# Env files (keep templates)
+.env
+.env.*
+!.env.example
+
+# Package manager artifacts
+package-lock.json
+yarn.lock
+pnpm-debug.log
+
+# Editor & OS files
+.DS_Store
+.idea/
+.vscode/

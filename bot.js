@@ -79,10 +79,14 @@ const USER_PROMPT_TEMPLATE = `
 async function bootstrapDatabase(path) {
   log('info', `Bootstrapping database at ${path}`);
   await mkdir(dirname(path), { recursive: true });
-  const db = await JSONFilePreset(path, { messages: [], members: {} });
+  const db = await JSONFilePreset(path, { messages: [], members: {}, botMessages: {} });
 
   if (!Array.isArray(db.data.messages)) {
     db.data.messages = [];
+  }
+
+  if (!db.data.botMessages || typeof db.data.botMessages !== 'object') {
+    db.data.botMessages = {};
   }
 
   if (!db.data.members || typeof db.data.members !== 'object') {
@@ -164,8 +168,51 @@ function getMemberRecord(db, chatId, userId) {
   return db.data.members?.[chatKey]?.[userKey] ?? null;
 }
 
-async function recordMemberJoin(db, chatId, user, joinedAt) {
+function getEarliestMessageTimestamp(db, chatId, userId) {
+  if (!Array.isArray(db.data.messages)) {
+    return null;
+  }
+
+  const targetChatId = Number(chatId);
+  const targetUserId = Number(userId);
+
+  let earliestMs = null;
+
+  for (const entry of db.data.messages) {
+    if (Number(entry.chatId) !== targetChatId) {
+      continue;
+    }
+
+    if (Number(entry.userId) !== targetUserId) {
+      continue;
+    }
+
+    if (!entry.evaluatedAt) {
+      continue;
+    }
+
+    const candidate = Date.parse(entry.evaluatedAt);
+    if (Number.isNaN(candidate)) {
+      continue;
+    }
+
+    if (earliestMs === null || candidate < earliestMs) {
+      earliestMs = candidate;
+    }
+  }
+
+  return earliestMs;
+}
+
+async function recordMemberJoin(db, chatId, user, joinedAt, options = {}) {
   if (!user?.id) {
+    return;
+  }
+
+  const { preferEarliest = false } = options;
+
+  const joinedMs = joinedAt.getTime();
+  if (!Number.isFinite(joinedMs)) {
     return;
   }
 
@@ -181,6 +228,15 @@ async function recordMemberJoin(db, chatId, user, joinedAt) {
   }
 
   const previousRecord = db.data.members[chatKey][userKey];
+  const previousMs = previousRecord?.joinedAt ? Date.parse(previousRecord.joinedAt) : null;
+  if (
+    typeof previousMs === 'number' &&
+    !Number.isNaN(previousMs) &&
+    ((preferEarliest && joinedMs >= previousMs) || (!preferEarliest && joinedMs <= previousMs))
+  ) {
+    return;
+  }
+
   const nextJoinedAt = joinedAt.toISOString();
 
   if (previousRecord?.joinedAt === nextJoinedAt) {
@@ -199,9 +255,70 @@ async function recordMemberJoin(db, chatId, user, joinedAt) {
   await db.write();
 }
 
-function hasBeenMemberLongerThanOneMonth(db, chatId, userId, referenceMs) {
+async function cleanupBotMessages(bot, db, chatId) {
+  if (!db.data.botMessages || typeof db.data.botMessages !== 'object') {
+    db.data.botMessages = {};
+  }
+
+  const chatKey = String(chatId);
+  const stored = Array.isArray(db.data.botMessages[chatKey])
+    ? [...db.data.botMessages[chatKey]]
+    : [];
+
+  if (!stored.length) {
+    return [];
+  }
+
+  const pending = [];
+
+  for (const messageId of stored) {
+    try {
+      await bot.deleteMessage(chatId, messageId);
+      log(
+        'info',
+        `Deleted previous bot message ${messageId} in chat ${chatId} before sending a new one.`,
+      );
+    } catch (error) {
+      pending.push(messageId);
+      log(
+        'warn',
+        `Unable to delete previous bot message ${messageId} in chat ${chatId}:`,
+        error,
+      );
+    }
+  }
+
+  db.data.botMessages[chatKey] = pending;
+  await db.write();
+  return pending;
+}
+
+async function sendExclusiveBotMessage(bot, db, chatId, text, options = {}) {
+  const pending = await cleanupBotMessages(bot, db, chatId);
+  const sentMessage = await bot.sendMessage(chatId, text, options);
+
+  if (!db.data.botMessages || typeof db.data.botMessages !== 'object') {
+    db.data.botMessages = {};
+  }
+
+  const chatKey = String(chatId);
+  db.data.botMessages[chatKey] = [...pending, sentMessage.message_id];
+  await db.write();
+
+  return sentMessage;
+}
+
+async function hasBeenMemberLongerThanOneMonth(db, chatId, userId, referenceMs) {
   const record = getMemberRecord(db, chatId, userId);
   if (!record?.joinedAt) {
+    const earliestMs = getEarliestMessageTimestamp(db, chatId, userId);
+    if (typeof earliestMs === 'number' && !Number.isNaN(earliestMs)) {
+      await recordMemberJoin(db, chatId, { id: userId }, new Date(earliestMs), {
+        preferEarliest: true,
+      });
+      const elapsed = referenceMs - earliestMs;
+      return elapsed >= ONE_MONTH_MS;
+    }
     return false;
   }
 
@@ -286,7 +403,7 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
         return;
       }
 
-      if (hasBeenMemberLongerThanOneMonth(db, chat.id, senderId, messageTimestampMs)) {
+      if (await hasBeenMemberLongerThanOneMonth(db, chat.id, senderId, messageTimestampMs)) {
         log(
           'info',
           `Skipping classification for message ${message.message_id} from longstanding member ${senderId} in chat ${chat.id}.`,
@@ -358,14 +475,16 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
 
     if (!silent && wasDeleted) {
       const notifyText = `疑似廣告訊息已刪除（評分 ${classification.score} / 10）。`;
-      await bot.sendMessage(chat.id, notifyText, {
+      await sendExclusiveBotMessage(bot, db, chat.id, notifyText, {
         disable_notification: true,
       });
     }
   } catch (error) {
     log('error', 'Failed to classify message:', error);
     if (!silent) {
-      await bot.sendMessage(
+      await sendExclusiveBotMessage(
+        bot,
+        db,
         chat.id,
         '暫時無法判斷此訊息是否為廣告，請稍後再試。',
         {

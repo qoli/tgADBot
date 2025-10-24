@@ -25,6 +25,7 @@ const DATABASE_PATH = resolve(
   process.cwd(),
   process.env.DATABASE_PATH || './data/db.json',
 );
+const ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
 if (!TELEGRAM_BOT_TOKEN) {
   log('error', 'Missing TELEGRAM_BOT_TOKEN in environment.');
@@ -78,7 +79,16 @@ const USER_PROMPT_TEMPLATE = `
 async function bootstrapDatabase(path) {
   log('info', `Bootstrapping database at ${path}`);
   await mkdir(dirname(path), { recursive: true });
-  const db = await JSONFilePreset(path, { messages: [] });
+  const db = await JSONFilePreset(path, { messages: [], members: {} });
+
+  if (!Array.isArray(db.data.messages)) {
+    db.data.messages = [];
+  }
+
+  if (!db.data.members || typeof db.data.members !== 'object') {
+    db.data.members = {};
+  }
+
   log('info', 'Database ready');
   return db;
 }
@@ -148,6 +158,62 @@ async function persistClassification(db, record) {
   await db.write();
 }
 
+function getMemberRecord(db, chatId, userId) {
+  const chatKey = String(chatId);
+  const userKey = String(userId);
+  return db.data.members?.[chatKey]?.[userKey] ?? null;
+}
+
+async function recordMemberJoin(db, chatId, user, joinedAt) {
+  if (!user?.id) {
+    return;
+  }
+
+  if (!db.data.members || typeof db.data.members !== 'object') {
+    db.data.members = {};
+  }
+
+  const chatKey = String(chatId);
+  const userKey = String(user.id);
+
+  if (!db.data.members[chatKey] || typeof db.data.members[chatKey] !== 'object') {
+    db.data.members[chatKey] = {};
+  }
+
+  const previousRecord = db.data.members[chatKey][userKey];
+  const nextJoinedAt = joinedAt.toISOString();
+
+  if (previousRecord?.joinedAt === nextJoinedAt) {
+    return;
+  }
+
+  db.data.members[chatKey][userKey] = {
+    joinedAt: nextJoinedAt,
+  };
+
+  log(
+    'info',
+    `Recorded join time for user ${user.id} in chat ${chatId} at ${nextJoinedAt}`,
+  );
+
+  await db.write();
+}
+
+function hasBeenMemberLongerThanOneMonth(db, chatId, userId, referenceMs) {
+  const record = getMemberRecord(db, chatId, userId);
+  if (!record?.joinedAt) {
+    return false;
+  }
+
+  const joinedMs = Date.parse(record.joinedAt);
+  if (Number.isNaN(joinedMs)) {
+    return false;
+  }
+
+  const elapsed = referenceMs - joinedMs;
+  return elapsed >= ONE_MONTH_MS;
+}
+
 function extractMessageText(message) {
   return (message.text || message.caption || '').trim();
 }
@@ -168,6 +234,29 @@ async function isChatAdmin(bot, chatId, userId) {
 
 async function handleIncomingMessage(bot, db, message, { silent } = {}) {
   const chat = message.chat;
+  if (!chat) {
+    return;
+  }
+
+  const messageTimestampMs =
+    typeof message.date === 'number' ? message.date * 1000 : Date.now();
+
+  if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) {
+    for (const newMember of message.new_chat_members) {
+      try {
+        await recordMemberJoin(db, chat.id, newMember, new Date(messageTimestampMs));
+      } catch (error) {
+        log(
+          'error',
+          `Failed to record join time for user ${newMember?.id ?? 'unknown'} in chat ${
+            chat.id
+          }:`,
+          error,
+        );
+      }
+    }
+  }
+
   const text = extractMessageText(message);
 
   if (!text) {
@@ -193,6 +282,14 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
         log(
           'info',
           `Skipping classification for admin message ${message.message_id} from ${senderId} in chat ${chat.id}.`,
+        );
+        return;
+      }
+
+      if (hasBeenMemberLongerThanOneMonth(db, chat.id, senderId, messageTimestampMs)) {
+        log(
+          'info',
+          `Skipping classification for message ${message.message_id} from longstanding member ${senderId} in chat ${chat.id}.`,
         );
         return;
       }

@@ -26,6 +26,7 @@ const DATABASE_PATH = resolve(
   process.env.DATABASE_PATH || './data/db.json',
 );
 const ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+const NEW_MEMBER_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
 
 if (!TELEGRAM_BOT_TOKEN) {
   log('error', 'Missing TELEGRAM_BOT_TOKEN in environment.');
@@ -308,27 +309,50 @@ async function sendExclusiveBotMessage(bot, db, chatId, text, options = {}) {
   return sentMessage;
 }
 
-async function hasBeenMemberLongerThanOneMonth(db, chatId, userId, referenceMs) {
+async function resolveMemberJoinedMs(db, chatId, userId) {
   const record = getMemberRecord(db, chatId, userId);
-  if (!record?.joinedAt) {
-    const earliestMs = getEarliestMessageTimestamp(db, chatId, userId);
-    if (typeof earliestMs === 'number' && !Number.isNaN(earliestMs)) {
-      await recordMemberJoin(db, chatId, { id: userId }, new Date(earliestMs), {
-        preferEarliest: true,
-      });
-      const elapsed = referenceMs - earliestMs;
-      return elapsed >= ONE_MONTH_MS;
-    }
-    return false;
+  if (record?.joinedAt) {
+    const joinedMs = Date.parse(record.joinedAt);
+    return Number.isNaN(joinedMs) ? null : joinedMs;
   }
 
-  const joinedMs = Date.parse(record.joinedAt);
-  if (Number.isNaN(joinedMs)) {
+  const earliestMs = getEarliestMessageTimestamp(db, chatId, userId);
+  if (typeof earliestMs === 'number' && !Number.isNaN(earliestMs)) {
+    await recordMemberJoin(db, chatId, { id: userId }, new Date(earliestMs), {
+      preferEarliest: true,
+    });
+    return earliestMs;
+  }
+
+  return null;
+}
+
+async function hasBeenMemberLongerThanOneMonth(db, chatId, userId, referenceMs) {
+  const joinedMs = await resolveMemberJoinedMs(db, chatId, userId);
+  if (joinedMs === null) {
     return false;
   }
 
   const elapsed = referenceMs - joinedMs;
+  if (!Number.isFinite(elapsed)) {
+    return false;
+  }
+
   return elapsed >= ONE_MONTH_MS;
+}
+
+async function isRecentMember(db, chatId, userId, referenceMs, windowMs) {
+  const joinedMs = await resolveMemberJoinedMs(db, chatId, userId);
+  if (joinedMs === null) {
+    return false;
+  }
+
+  const elapsed = referenceMs - joinedMs;
+  if (!Number.isFinite(elapsed)) {
+    return false;
+  }
+
+  return elapsed <= windowMs;
 }
 
 function extractMessageText(message) {
@@ -392,6 +416,7 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
   try {
     const senderId = message.from?.id ?? null;
     let senderIsAdmin = false;
+    let senderIsRecentMember = false;
 
     if (senderId !== null) {
       senderIsAdmin = await isChatAdmin(bot, chat.id, senderId);
@@ -410,6 +435,14 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
         );
         return;
       }
+
+      senderIsRecentMember = await isRecentMember(
+        db,
+        chat.id,
+        senderId,
+        messageTimestampMs,
+        NEW_MEMBER_WINDOW_MS,
+      );
     }
 
     const classification = await classifyMessage({
@@ -419,10 +452,12 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
       model: LLM_MODEL,
     });
 
-      log(
-        'info',
-        `Classification result for message ${message.message_id}: score=${classification.score}, raw="${classification.rawAnswer}"`,
-      );
+    const deletionThreshold = senderIsRecentMember ? 6 : 8;
+
+    log(
+      'info',
+      `Classification result for message ${message.message_id}: score=${classification.score}, threshold=${deletionThreshold}, raw="${classification.rawAnswer}"`,
+    );
 
     const record = {
       chatId: chat.id,
@@ -440,7 +475,7 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
     let wasDeleted = false;
     let deletionSkippedReason = null;
 
-    if (classification.score > 8) {
+    if (classification.score > deletionThreshold) {
       if (record.userId !== null && senderIsAdmin) {
         deletionSkippedReason = 'chat_admin';
         log(
@@ -450,7 +485,7 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
       } else {
         log(
           'info',
-          `Score ${classification.score} exceeds threshold. Attempting to delete message ${message.message_id} in chat ${chat.id}.`,
+          `Score ${classification.score} exceeds threshold ${deletionThreshold}. Attempting to delete message ${message.message_id} in chat ${chat.id}.`,
         );
         try {
           await bot.deleteMessage(chat.id, message.message_id);

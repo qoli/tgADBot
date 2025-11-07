@@ -145,6 +145,34 @@ async function classifyMessage({ text, apiUrl, apiKey, model }) {
   };
 }
 
+async function pingLLM({ apiUrl, apiKey, model }) {
+  const payload = {
+    model,
+    messages: [{ role: 'user', content: 'ping' }],
+    temperature: 0,
+    max_tokens: 16,
+  };
+
+  const response = await fetch(`${apiUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `LLM ping failed with status ${response.status}: ${errorText}`,
+    );
+  }
+
+  const data = await response.json();
+  return data?.choices?.[0]?.message?.content?.trim() ?? '';
+}
+
 async function persistClassification(db, record) {
   const existingIndex = db.data.messages.findIndex(
     (entry) =>
@@ -570,6 +598,16 @@ async function processBacklog(bot, db) {
 async function main() {
   const db = await bootstrapDatabase(DATABASE_PATH);
   const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+  try {
+    const pingResponse = await pingLLM({
+      apiUrl: LLM_API_URL,
+      apiKey: LLM_API_KEY,
+      model: LLM_MODEL,
+    });
+    log('info', pingResponse);
+  } catch (error) {
+    log('error', 'Failed to ping LLM on startup:', error);
+  }
 
   await processBacklog(bot, db);
   await bot.startPolling();

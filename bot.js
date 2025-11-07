@@ -417,8 +417,7 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
       } catch (error) {
         log(
           'error',
-          `Failed to record join time for user ${newMember?.id ?? 'unknown'} in chat ${
-            chat.id
+          `Failed to record join time for user ${newMember?.id ?? 'unknown'} in chat ${chat.id
           }:`,
           error,
         );
@@ -604,6 +603,7 @@ async function main() {
       apiKey: LLM_API_KEY,
       model: LLM_MODEL,
     });
+    log('info', "ping...")
     log('info', pingResponse);
   } catch (error) {
     log('error', 'Failed to ping LLM on startup:', error);

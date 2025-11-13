@@ -27,6 +27,17 @@ const DATABASE_PATH = resolve(
 );
 const ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 const NEW_MEMBER_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+const READ_ONLY_CHAT_PERMISSIONS = {
+  can_send_messages: false,
+  can_send_media_messages: false,
+  can_send_polls: false,
+  can_send_other_messages: false,
+  can_add_web_page_previews: false,
+  can_change_info: false,
+  can_invite_users: false,
+  can_pin_messages: false,
+  can_manage_topics: false,
+};
 
 if (!TELEGRAM_BOT_TOKEN) {
   log('error', 'Missing TELEGRAM_BOT_TOKEN in environment.');
@@ -337,6 +348,31 @@ async function sendExclusiveBotMessage(bot, db, chatId, text, options = {}) {
   return sentMessage;
 }
 
+async function revokeMemberSpeakingRights(bot, chatId, userId) {
+  if (typeof userId !== 'number') {
+    return false;
+  }
+
+  try {
+    await bot.restrictChatMember(chatId, userId, {
+      permissions: READ_ONLY_CHAT_PERMISSIONS,
+      use_independent_chat_permissions: true,
+    });
+    log(
+      'info',
+      `Restricted user ${userId} from sending messages in chat ${chatId} after ad removal.`,
+    );
+    return true;
+  } catch (error) {
+    log(
+      'error',
+      `Failed to restrict user ${userId} in chat ${chatId} after ad removal:`,
+      error,
+    );
+    return false;
+  }
+}
+
 async function resolveMemberJoinedMs(db, chatId, userId) {
   const record = getMemberRecord(db, chatId, userId);
   if (record?.joinedAt) {
@@ -526,6 +562,18 @@ async function handleIncomingMessage(bot, db, message, { silent } = {}) {
         } catch (deleteError) {
           log('error', 'Failed to delete high-score message:', deleteError);
         }
+      }
+    }
+
+    if (wasDeleted && record.userId !== null) {
+      const restricted = await revokeMemberSpeakingRights(
+        bot,
+        chat.id,
+        record.userId,
+      );
+      if (restricted) {
+        record.restricted = true;
+        record.restrictedAt = new Date().toISOString();
       }
     }
 
